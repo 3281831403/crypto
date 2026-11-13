@@ -80,20 +80,21 @@ func wildcardMatch(pat []byte, str []byte) bool {
 		if len(pat) == 0 {
 			return len(str) == 0
 		}
-		if len(str) == 0 {
-			return false
-		}
-
 		if pat[0] == '*' {
-			if len(pat) == 1 {
+			pat = pat[1:]
+			if len(pat) == 0 {
 				return true
 			}
 
 			for j := range str {
-				if wildcardMatch(pat[1:], str[j:]) {
+				if wildcardMatch(pat, str[j:]) {
 					return true
 				}
 			}
+			return false
+		}
+
+		if len(str) == 0 {
 			return false
 		}
 
@@ -157,7 +158,7 @@ func (db *hostKeyDB) IsHostAuthority(remote ssh.PublicKey, address string) bool 
 	if err != nil {
 		return false
 	}
-	a := addr{host: h, port: p}
+	a := addr{host: lowerASCII(h), port: p}
 
 	for _, l := range db.lines {
 		if l.cert && keyEq(l.knownKey.Key, remote) && l.match(a) {
@@ -300,6 +301,7 @@ func newHostnameMatcher(pattern string) (matcher, error) {
 				a.port = "22"
 			}
 		}
+		a.host = lowerASCII(a.host)
 		hps = append(hps, hostPattern{
 			negate: negate,
 			addr:   a,
@@ -359,7 +361,7 @@ func (db *hostKeyDB) check(address string, remote net.Addr, remoteKey ssh.Public
 		return fmt.Errorf("knownhosts: SplitHostPort(%s): %v", remote, err)
 	}
 
-	hostToCheck := addr{host, port}
+	hostToCheck := addr{lowerASCII(host), port}
 	if address != "" {
 		// Give preference to the hostname if available.
 		host, port, err := net.SplitHostPort(address)
@@ -367,7 +369,7 @@ func (db *hostKeyDB) check(address string, remote net.Addr, remoteKey ssh.Public
 			return fmt.Errorf("knownhosts: SplitHostPort(%s): %v", address, err)
 		}
 
-		hostToCheck = addr{host, port}
+		hostToCheck = addr{lowerASCII(host), port}
 	}
 
 	return db.checkAddr(hostToCheck, remoteKey)
@@ -438,7 +440,9 @@ func (db *hostKeyDB) Read(r io.Reader, filename string) error {
 // ssh.ClientConfig.HostKeyCallback. By preference, the key check
 // operates on the hostname if available, i.e. if a server changes its
 // IP address, the host key check will still succeed, even though a
-// record of the new IP address is not available. Lines that cannot be
+// record of the new IP address is not available. Host names are matched
+// ASCII case insensitively, except against the principals of a host
+// certificate, which have to be lower case. Lines that cannot be
 // parsed are skipped, but an error is returned if a file contains invalid
 // lines and no valid ones.
 func New(files ...string) (ssh.HostKeyCallback, error) {
@@ -459,12 +463,17 @@ func New(files ...string) (ssh.HostKeyCallback, error) {
 	certChecker.IsRevoked = db.IsRevoked
 	certChecker.HostKeyFallback = db.check
 
-	return certChecker.CheckHostKey, nil
+	// Fold the address before the certificate checks, as ssh_login does, so
+	// that the certificate principals are checked against the folded name.
+	return func(address string, remote net.Addr, key ssh.PublicKey) error {
+		return certChecker.CheckHostKey(lowerASCII(address), remote, key)
+	}, nil
 }
 
 // Normalize normalizes an address into the form used in known_hosts. Supports
 // IPv4, hostnames, bracketed IPv6. Any other non-standard formats are returned
-// with minimal transformation.
+// with minimal transformation. The host is folded to lower case, unless it is
+// a hashed host name.
 func Normalize(address string) string {
 	const defaultSSHPort = "22"
 
@@ -477,6 +486,9 @@ func Normalize(address string) string {
 	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
 		host = host[1 : len(host)-1]
 	}
+	if !strings.HasPrefix(host, "|") {
+		host = lowerASCII(host)
+	}
 
 	if port == defaultSSHPort {
 		return host
@@ -484,19 +496,53 @@ func Normalize(address string) string {
 	return "[" + host + "]:" + port
 }
 
-// Line returns a line to add append to the known_hosts files.
+// writableAddr reports whether address, as returned by [Normalize], is read
+// back as a single host pattern that matches only address itself.
+func writableAddr(address string) bool {
+	if address == "" {
+		return false
+	}
+	if address[0] == '|' {
+		h, err := newHashedHost(address)
+		// The base64 decoder skips \r and \n, so require the canonical form.
+		return err == nil && encodeHash(sha1HashType, h.salt, h.hash) == address
+	}
+	for i := 0; i < len(address); i++ {
+		switch c := address[i]; c {
+		case '!', '#', '*', ',', '?', '@', '|':
+			return false
+		default:
+			if c <= ' ' || c == 0x7f {
+				return false
+			}
+		}
+	}
+	// Reject what Read would reject, such as an unbalanced bracket.
+	_, err := newHostnameMatcher(address)
+	return err == nil
+}
+
+// Line returns a line to append to the known_hosts files, or an empty string
+// if addresses is empty or one of them cannot be written as a host pattern.
 func Line(addresses []string, key ssh.PublicKey) string {
 	var trimmed []string
 	for _, a := range addresses {
-		trimmed = append(trimmed, Normalize(a))
+		a = Normalize(a)
+		if !writableAddr(a) {
+			return ""
+		}
+		trimmed = append(trimmed, a)
+	}
+	if len(trimmed) == 0 {
+		return ""
 	}
 
 	return strings.Join(trimmed, ",") + " " + serialize(key)
 }
 
-// HashHostname hashes the given hostname. The hostname is not
-// normalized before hashing.
+// HashHostname hashes the given hostname, folded to lower case.
 func HashHostname(hostname string) string {
+	hostname = lowerASCII(hostname)
 	// TODO(hanwen): check if we can safely normalize this always.
 	salt := make([]byte, sha1.Size)
 
@@ -570,6 +616,25 @@ func newHashedHost(encoded string) (*hashedHost, error) {
 
 func (h *hashedHost) match(a addr) bool {
 	return bytes.Equal(hashHost(Normalize(a.String()), h.salt), h.hash)
+}
+
+// lowerASCII returns s with the ASCII upper case letters folded to lower case.
+func lowerASCII(s string) string {
+	var b []byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 'A' || c > 'Z' {
+			continue
+		}
+		if b == nil {
+			b = []byte(s)
+		}
+		b[i] = c + ('a' - 'A')
+	}
+	if b == nil {
+		return s
+	}
+	return string(b)
 }
 
 // trimSpace removes leading and trailing ASCII space and tab.

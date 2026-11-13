@@ -11,11 +11,14 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/testdata"
 )
 
 const edKeyStr = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGBAarftlLeoyf+v+nVchEZII/vna2PCV8FaX4vsF5BX"
@@ -236,16 +239,209 @@ func TestWildcard(t *testing.T) {
 	}
 }
 
+func TestWildcardZeroMatch(t *testing.T) {
+	// A trailing * must match zero characters. "server*" should match "server".
+	db := testDB(t, "server* "+edKeyStr)
+	if err := db.check("server:22", &net.TCPAddr{Port: 22}, edKey); err != nil {
+		t.Errorf("server* should match server, got: %v", err)
+	}
+	if err := db.check("server1:22", &net.TCPAddr{Port: 22}, edKey); err != nil {
+		t.Errorf("server* should match server1, got: %v", err)
+	}
+}
+
 func TestLine(t *testing.T) {
+	const hashed = "|1|/EGkffTAEwy1I1cR3olUo+P4aec=|3grwgSvL5iFUZG59t6XnzZVlm9I="
 	for in, want := range map[string]string{
 		"server.org":                             "server.org " + edKeyStr,
 		"server.org:22":                          "server.org " + edKeyStr,
 		"server.org:23":                          "[server.org]:23 " + edKeyStr,
 		"[c629:1ec4:102:304:102:304:102:304]:22": "c629:1ec4:102:304:102:304:102:304 " + edKeyStr,
 		"[c629:1ec4:102:304:102:304:102:304]:23": "[c629:1ec4:102:304:102:304:102:304]:23 " + edKeyStr,
+		"Server.Example.COM":                     "server.example.com " + edKeyStr,
+		hashed:                                   hashed + " " + edKeyStr,
 	} {
 		if got := Line([]string{in}, edKey); got != want {
 			t.Errorf("Line(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestLineInvalidAddress(t *testing.T) {
+	hashed := HashHostname("server.org")
+	hashPrefix := hashed[:strings.LastIndexByte(hashed, '|')+1]
+	for _, in := range []string{
+		"",
+		"server.org key",
+		"server.org\tkey",
+		"server.org\n@cert-authority * " + edKeyStr,
+		"server.org\r",
+		"server.org\x00",
+		"server.org,evil.org",
+		"*.server.org",
+		"server.?rg",
+		"!server.org",
+		"@cert-authority",
+		"#server.org",
+		"|1|not base64",
+		"|2|" + HashHostname("server.org")[3:],
+		hashPrefix + "AA\nserver",
+		hashPrefix + "AA\rserver",
+		"[server.org",
+		"[server.org]x",
+		"[server.org]:22:22",
+	} {
+		if got := Line([]string{in}, edKey); got != "" {
+			t.Errorf("Line(%q) = %q, want %q", in, got, "")
+		}
+		if got := Line([]string{"server.org", in}, edKey); got != "" {
+			t.Errorf("Line(server.org, %q) = %q, want %q", in, got, "")
+		}
+	}
+
+	if got := Line(nil, edKey); got != "" {
+		t.Errorf("Line(nil) = %q, want %q", got, "")
+	}
+}
+
+func TestLineHashedHost(t *testing.T) {
+	hashed := HashHostname("server.org")
+	line := Line([]string{hashed}, edKey)
+	if want := hashed + " " + edKeyStr; line != want {
+		t.Fatalf("Line(%q) = %q, want %q", hashed, line, want)
+	}
+
+	db := testDB(t, line)
+	if err := db.check("server.org:22", testAddr, edKey); err != nil {
+		t.Errorf("check: %v", err)
+	}
+}
+
+func TestCaseInsensitiveMatch(t *testing.T) {
+	for _, test := range []struct {
+		entry, address string
+		want           bool
+	}{
+		{"hostname " + edKeyStr, "HOSTNAME:22", true},
+		{"HOSTNAME " + edKeyStr, "hostname:22", true},
+		{"*.example.com " + edKeyStr, "SERVER.Example.com:22", true},
+		{"[hostname]:23 " + edKeyStr, "HOSTNAME:23", true},
+		{"*.example.com,!blocked.example.com " + edKeyStr, "blocked.example.com:22", false},
+		{"*.example.com,!blocked.example.com " + edKeyStr, "BLOCKED.example.com:22", false},
+		{"*.example.com,!BLOCKED.example.com " + edKeyStr, "blocked.example.com:22", false},
+		{"*.example.com,!blocked.example.com " + edKeyStr, "other.example.com:22", true},
+		// Only ASCII is folded.
+		{"kelvin.example.com " + edKeyStr, "Kelvin.example.com:22", false},
+		{"istanbul.example.com " + edKeyStr, "İstanbul.example.com:22", false},
+	} {
+		db := testDB(t, test.entry)
+		err := db.check(test.address, testAddr, edKey)
+		if got := err == nil; got != test.want {
+			t.Errorf("check(%q) with entry %q = %v (%v), want %v",
+				test.address, test.entry, got, err, test.want)
+		}
+	}
+}
+
+func TestCaseInsensitiveKeyMismatch(t *testing.T) {
+	db := testDB(t, "server.example.com "+edKeyStr)
+	err := db.check("SERVER.example.com:22", testAddr, alternateEdKey)
+	if ke, ok := err.(*KeyError); !ok {
+		t.Fatalf("got %v, want *KeyError", err)
+	} else if len(ke.Want) == 0 {
+		t.Fatal("got empty KeyError.Want, want the key known for the host")
+	}
+}
+
+func TestCaseInsensitiveIsHostAuthority(t *testing.T) {
+	for _, test := range []struct {
+		entry, address string
+		want           bool
+	}{
+		{"*.example.com,!blocked.example.com", "other.example.com:22", true},
+		{"*.example.com,!blocked.example.com", "OTHER.example.com:22", true},
+		{"*.example.com,!blocked.example.com", "blocked.example.com:22", false},
+		{"*.example.com,!blocked.example.com", "BLOCKED.example.com:22", false},
+		{"*.example.com,!blocked.example.com", "Blocked.Example.Com:22", false},
+		{"*.example.com,!Blocked.example.com", "other.example.com:22", true},
+		{"*.example.com,!Blocked.example.com", "blocked.example.com:22", false},
+		{"*.example.com,!Blocked.example.com", "Blocked.example.com:22", false},
+	} {
+		db := testDB(t, "@cert-authority "+test.entry+" "+edKeyStr)
+		if got := db.IsHostAuthority(edKey, test.address); got != test.want {
+			t.Errorf("IsHostAuthority(%q) with entry %q = %v, want %v",
+				test.address, test.entry, got, test.want)
+		}
+	}
+}
+
+func TestCaseInsensitiveHashedMatch(t *testing.T) {
+	for _, hostname := range []string{"HOSTNAME", "hostname"} {
+		db := testDB(t, HashHostname(hostname)+" "+edKeyStr)
+		for _, address := range []string{"hostname:22", "HostName:22"} {
+			if err := db.check(address, testAddr, edKey); err != nil {
+				t.Errorf("check(%s) with entry hashed from %q: %v", address, hostname, err)
+			}
+		}
+	}
+}
+
+func TestCaseInsensitiveCertificate(t *testing.T) {
+	caSigner, err := ssh.ParsePrivateKey(testdata.PEMBytes["ed25519"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	signCert := func(principal string) *ssh.Certificate {
+		cert := &ssh.Certificate{
+			CertType:        ssh.HostCert,
+			Key:             edKey,
+			ValidBefore:     ssh.CertTimeInfinity,
+			ValidPrincipals: []string{principal},
+		}
+		if err := cert.SignCert(rand.Reader, caSigner); err != nil {
+			t.Fatal(err)
+		}
+		return cert
+	}
+
+	fn := filepath.Join(t.TempDir(), "known_hosts")
+	entry := "@cert-authority *.example.com,!Blocked.example.com " +
+		serialize(caSigner.PublicKey()) + "\n"
+	if err := os.WriteFile(fn, []byte(entry), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cb, err := New(fn)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		noAuthority = "no authorities"
+		noPrincipal = "not in the set of valid principals"
+	)
+	for _, test := range []struct {
+		principal, address string
+		wantErr            string
+	}{
+		{"server.example.com", "server.example.com:22", ""},
+		{"server.example.com", "SERVER.example.com:22", ""},
+		{"server.example.com", "Server.Example.Com:22", ""},
+		{"server.example.com", "other.example.com:22", noPrincipal},
+		// Principals are not folded, so one holding upper case letters
+		// matches no address.
+		{"Server.example.com", "Server.example.com:22", noPrincipal},
+		{"Server.example.com", "server.example.com:22", noPrincipal},
+		{"blocked.example.com", "blocked.example.com:22", noAuthority},
+		{"BLOCKED.example.com", "BLOCKED.example.com:22", noAuthority},
+		{"Blocked.example.com", "Blocked.example.com:22", noAuthority},
+	} {
+		err := cb(test.address, testAddr, signCert(test.principal))
+		switch {
+		case test.wantErr == "" && err != nil:
+			t.Errorf("callback(%q) with principal %q: %v", test.address, test.principal, err)
+		case test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)):
+			t.Errorf("callback(%q) with principal %q = %v, want error containing %q",
+				test.address, test.principal, err, test.wantErr)
 		}
 	}
 }
@@ -268,6 +464,17 @@ func TestWildcardMatch(t *testing.T) {
 		{"a*b*z", "axxbxxbxxxz", true},
 		{"a*b*z", "axxbxxzxxxz", true},
 		{"a*b*z", "axxbxxzxxx", false},
+		{"server*", "server", true},
+		{"server*", "server1", true},
+		{"*", "", true},
+		{"*", "a", true},
+		{"a*", "a", true},
+		{"**", "", false},
+		{"*server", "server", true},
+		{"*server", "myserver", true},
+		{"*server", "serve", false},
+		{"??*rver", "server", true},
+		{"??rver", "server", true},
 	} {
 		got := wildcardMatch([]byte(c.pat), []byte(c.str))
 		if got != c.want {
@@ -414,6 +621,7 @@ func testHostHash(t *testing.T, hostname, encoded string) {
 }
 
 func TestNormalize(t *testing.T) {
+	const hashed = "|1|/EGkffTAEwy1I1cR3olUo+P4aec=|3grwgSvL5iFUZG59t6XnzZVlm9I="
 	for in, want := range map[string]string{
 		"127.0.0.1":                 "127.0.0.1",
 		"127.0.0.1:22":              "127.0.0.1",
@@ -434,6 +642,13 @@ func TestNormalize(t *testing.T) {
 		"2001::db8:1":               "2001::db8:1",
 		"2001::db8:1:22":            "2001::db8:1:22",
 		"2001::db8:1:2200":          "2001::db8:1:2200",
+		"HOSTNAME":                  "hostname",
+		"HostName:23":               "[hostname]:23",
+		"[2001:DB8::1]:23":          "[2001:db8::1]:23",
+		"[FE80::1%Eth0]:23":         "[fe80::1%eth0]:23",
+		hashed:                      hashed,
+		"[" + hashed + "]":          hashed,
+		hashed + ":23":              "[" + hashed + "]:23",
 	} {
 		got := Normalize(in)
 		if got != want {
